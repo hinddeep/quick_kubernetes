@@ -1,0 +1,185 @@
+---
+- hosts: all
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    k8s_common_modprobe:
+    - name: overlay
+    - name: br_netfilter
+    k8s_common_sysctl:
+    - name: net.bridge.bridge-nf-call-iptables
+      value: 1
+    - name: net.ipv4.ip_forward
+      value: 1
+    - name: net.bridge.bridge-nf-call-ip6tables
+      value: 1
+  tasks:
+  - name: Install various base packages
+    apt:
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg-agent
+      - software-properties-common
+      - build-essential
+      - "linux-headers-{{ ansible_kernel }}"
+      - git
+
+  - name: Add an apt signing key for Docker
+    apt_key:
+      url: https://download.docker.com/linux/debian/gpg
+      state: present
+
+  - name: Add apt repository for stable version
+    apt_repository:
+      repo: deb [arch=amd64] https://download.docker.com/linux/debian bullseye stable
+      state: present
+
+  - name: Install Containerd and its dependencies
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - containerd.io
+
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    with_items:
+      - swap
+      - none
+
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+
+  - name: Add an apt signing key for Kubernetes
+    apt_key:
+      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      state: present
+
+  - name: Adding apt repository for Kubernetes
+    apt_repository:
+      repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+      state: present
+      filename: kubernetes.list
+
+  - name: Install Kubernetes binaries
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+        - kubelet=1.24.2-00 
+        - kubeadm=1.24.2-00 
+        - kubectl=1.24.2-00 
+
+  - name: Configure node ip
+    lineinfile:
+      path: /etc/default/kubelet
+      line: KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}
+      create: yes
+
+  - name: Load containerd kernel modules
+    modprobe:
+      name: "{{ item.name }}"
+      state: present
+    loop: "{{ k8s_common_modprobe }}"
+
+  - name: Configure kubernetes-cri sys params
+    sysctl:
+      name: "{{ item.name }}"
+      value: "{{ item.value }}"
+      state: present
+      reload: yes
+    loop: "{{ k8s_common_sysctl }}"
+
+  - name: Delete configuration for containerd.conf (see https://github.com/containerd/containerd/$    
+    file:
+      state: absent
+      path:  /etc/containerd/config.toml
+
+  - name: Restart kubelet
+    service:
+      name: kubelet
+      daemon_reload: yes
+      state: restarted
+
+  - name: Reset kubeadm (if retry)
+    command: "{{ item }}"
+    with_items:
+      - kubeadm reset --force
+      - rm -rf /home/vagrant/.kube
+
+  - name: Restart containerd
+    service:
+      name: containerd
+      daemon_reload: yes
+      state: restarted
+
+  - name: Copy the join command to server location
+    copy: src=join-command dest=/tmp/join-command.sh mode=0777
+
+  - name: Pausing
+    pause:
+      seconds: 20
+
+  - name: Join the node to cluster
+    command: sh /tmp/join-command.sh
+
+  - name: Autocomplete Kubernetes
+    shell: echo 'source <(kubectl completion bash)' >> /home/vagrant/.bashrc
+
+  - name: Fetch gtp5g module from GitHub
+    git:
+      repo: https://github.com/free5gc/gtp5g.git
+      dest: /home/vagrant/gtp5g
+
+  - name: Make and install gtp5g module
+    shell: "{{ item }}"
+    with_items:
+      - make clean
+      - make
+      - make install
+    args:
+     chdir: /home/vagrant/gtp5g
+
+  - name: Install nerdctl
+    command: "{{ item }}"
+    with_items:
+      - sudo wget -q https://github.com/containerd/nerdctl/releases/download/v0.20.0/nerdctl-0.20.0-linux-amd64.tar.gz -O /home/vagrant/nerdctl.tar.gz
+      - mkdir -p /home/vagrant/.local/bin
+    become: yes
+    become_user: vagrant
+
+  - name: Uncompress nerdctl
+    unarchive:
+      src: /home/vagrant/nerdctl.tar.gz
+      dest: /home/vagrant/.local/bin/
+      remote_src: yes
+    become: yes
+    become_user: vagrant
+
+  - name: Clean and setup nerdctl
+    command: "{{ item }}"
+    with_items:
+      - rm -rf /home/vagrant/nerdctl.tar.gz
+      - echo 'export PATH="${PATH}:/home/vagrant/.local/bin"' >> /home/vagrant/.bashrc
+    become: yes
+    become_user: vagrant
+
+  - name: Setup nerdctl
+    command: "{{ item }}"
+    with_items:
+      - sudo chown root /home/vagrant/.local/bin/nerdctl
+      - sudo chmod +s /home/vagrant/.local/bin/nerdctl

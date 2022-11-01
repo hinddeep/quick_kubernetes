@@ -1,0 +1,189 @@
+---
+- hosts: all
+  become: true 
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+  - name: Install various base packages
+    apt:
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg-agent
+      - software-properties-common
+      - build-essential
+      - "linux-headers-{{ ansible_kernel }}"
+
+  - name: Add an apt signing key for Docker
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+
+  - name: Add apt repository for stable version
+    apt_repository:
+      repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu xenial stable
+      state: present
+
+  - name: Install Docker and its dependencies
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - docker-ce 
+      - docker-ce-cli 
+      - containerd.io
+    notify:
+      - docker status
+
+  - name: Add vagrant user to docker group
+    user:
+      name: vagrant
+      group: docker
+
+  - name: Set Docker cgroup-driver to systemd
+    copy:
+      content: |
+        {
+          "exec-opts": ["native.cgroupdriver=systemd"]
+        }
+      dest: /etc/docker/daemon.json
+
+  - name: Restart Docker daemon
+    command: systemctl restart docker
+
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    with_items:
+      - swap
+      - none
+
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+
+  - name: Add an apt signing key for Kubernetes
+    apt_key:
+      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      state: present
+
+  - name: Adding apt repository for Kubernetes
+    apt_repository:
+      repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+      state: present
+      filename: kubernetes.list
+
+  - name: Install Kubernetes binaries
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+        - kubelet 
+        - kubeadm 
+        - kubectl
+
+  - name: Configure node ip
+    lineinfile:
+      path: /etc/default/kubelet
+      line: KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}
+      create: yes
+
+  - name: Restart kubelet
+    service:
+      name: kubelet
+      daemon_reload: yes
+      state: restarted
+
+  - name: Reset kubeadm (if retry)
+    command: "{{ item }}"
+    with_items:
+      - kubeadm reset --force --cri-socket=/run/cri-dockerd.sock
+      - rm -rf /home/vagrant/.kube
+
+  - name: Install CRI-dockerd
+    command: "{{ item }}"
+    with_items:
+      - wget -q https://github.com/Mirantis/cri-dockerd/releases/download/v0.2.0/cri-dockerd-v0.2.0-linux-amd64.tar.gz -O cri-dockerd.tar.gz
+      - tar -zxvf cri-dockerd.tar.gz
+      - rm -rf /usr/local/bin/cri-dockerd
+      - rm -f /usr/local/bin/cri-dockerd
+      - mv cri-dockerd /usr/local/bin/
+      - wget -q https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.service
+      - wget -q https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.socket
+      - mv cri-docker.socket cri-docker.service /etc/systemd/system/
+      - sudo sed -i -e 's,/usr/bin/cri-dockerd,/usr/local/bin/cri-dockerd,' /etc/systemd/system/cri-docker.service
+      - systemctl daemon-reload
+      - systemctl enable cri-docker.service
+      - systemctl enable --now cri-docker.socket
+
+
+  - name: Initialize the Kubernetes cluster using kubeadm
+    command: kubeadm init --apiserver-advertise-address="192.168.56.10" --apiserver-cert-extra-sans="192.168.56.10"  --node-name k8s-master --pod-network-cidr=192.168.0.0/16 --cri-socket=/run/cri-dockerd.sock
+
+  - name: Setup kubeconfig for vagrant user
+    command: "{{ item }}"
+    with_items:
+      - mkdir -p /home/vagrant/.kube
+      - cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+      - chown vagrant:vagrant /home/vagrant/.kube/config
+
+  - name: Install calico pod network
+    become: false
+    command: kubectl apply -f http://lwgitea.consrc.ca:3000/hkerma/kubernetes-free5gc/raw/branch/master/calico.yaml
+
+#  - name: Install Flannel
+#    become: false
+#    command: kubectl apply -f https://lwgitea.consrc.ca:3000/hkerma/quick-kubernetes/raw/branch/master/flannel.yaml   
+
+  - name: Generate join command
+    command: kubeadm token create --print-join-command
+    register: join_command
+
+  - name: Copy join command to local file
+    become: false
+    local_action: copy content="{{ join_command.stdout_lines[0] }}" dest="./join-command"
+  
+  - name: Install bash completion for Kubernetes
+    apt:
+      name: bash-completion
+      state: present
+  
+  - name: Autocomplete Kubernetes
+    shell: "{{ item }}"
+    with_items:
+      - echo 'source /usr/share/bash-completion/bash_completion' >> /home/vagrant/.bashrc
+      - echo 'source <(kubectl completion bash)' >> /home/vagrant/.bashrc
+
+  - name: Install Helm
+    snap:
+      name: helm
+      classic: yes
+
+  - name: Fetch gtp5g module from GitHub
+    git:
+      repo: https://github.com/free5gc/gtp5g.git
+      dest: /home/vagrant/gtp5g
+
+  - name: Make and install gtp5g module
+    shell: "{{ item }}"
+    with_items:
+      - make clean
+      - make
+      - make install
+    args:
+     chdir: /home/vagrant/gtp5g
+
+  handlers:
+    - name: docker status
+      service: name=docker state=started
